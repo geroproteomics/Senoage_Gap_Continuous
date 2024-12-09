@@ -1,0 +1,107 @@
+#set seeds; only run once
+seeds <- vector("list", length = 11)
+for(i in 1:10) seeds[[i]]<- sample.int(n=1000, 1)
+seeds[[11]]<-sample.int(1000, 1)
+
+#function that finds ENSPs for age, produces Seno-Age, conducts CV (Seno-Age predicts traits) with caret
+#returns lisp of top ENSPs for Seno-Age, df of 10 iterations of CV R-Squared
+senoage_gap_en_cv_test_fast <- function(clin_df, protein_list, cat_control, cont_control, trait_list, alpha, num_ensp,study="B"){
+  
+  #Setup backend to use many processors
+  totalCores = detectCores()
+  #Leave one core to avoid overload your computer
+  cluster <- makeCluster(totalCores[1]-1)
+  registerDoParallel(cluster)
+  
+  ##make master list of top ensps by tissue and trait
+  df_master_ensp <- vector(mode = "list", length = 0)
+  
+  ##make df to hold all Rsquared for 10 trials for all traits and tissues
+  df_master_Rsquared <- as.data.frame(matrix(NA,nrow=0,ncol=3))
+  colnames(df_master_Rsquared) <- c("Rsquared","Tissue","Trait")
+  
+  ##loop through sets of proteins, find ensp, cv predictive potential 
+  for(val in names(protein_list)){
+    ##make df to hold ENSPs for each trait
+    df_ensps_per_trait <- as.data.frame(matrix(NA,nrow=num_ensp,ncol=length(1)))
+    colnames(df_ensps_per_trait) <- "age"
+    
+    ##determine ENSPs for all traits
+    #convert protein list to BLSA nomenclature 
+    if(study=="B"){
+      temp_proteins <- df_sencat_blsa[df_sencat_blsa$gene %in% protein_list[[val]], "unique_gene"]
+    }
+    if(study =="I"){
+      temp_proteins <- df_sencat_inchianti[df_sencat_inchianti$gene %in% protein_list[[val]], "unique_gene"]
+    }
+    temp_en_object <- en_repeat_fast(clin_df, temp_proteins, cat_control, cont_control, trait_list = c("age","BMI"), alpha, heatmap=FALSE)
+    #pull coef df
+    temp_en_coef_subset <- temp_en_object$coef
+    
+    ##add ensps to list
+    #find ensps, subset to specific number 
+    temp_ensps <- temp_en_coef_subset["age",temp_en_coef_subset["age",] != 0]
+    temp_ensps <- temp_ensps[!colnames(temp_ensps) %in% c(cat_control,cont_control)]
+    if(length(temp_ensps)<1) next 
+    temp_ensps <- t(temp_ensps)
+    temp_ensps <- as.data.frame(temp_ensps)
+    #add dummy column for re-ordering 
+    temp_ensps$dumb <- NA
+    temp_ensps <- temp_ensps[rev(order(abs(temp_ensps[,"age"]))),]
+    if(nrow(temp_ensps) <=num_ensp){
+      temp_ensps <- rownames(temp_ensps)
+    }
+    else{
+      temp_ensps <- rownames(temp_ensps)[1:num_ensp]
+    }
+    #fill df of specified number of ENSPs per trait
+    df_ensps_per_trait[1:length(temp_ensps),"age"] <- temp_ensps
+    
+    ##make seno-age gap from age-ensps
+    clin_df_senoage <- clin_df
+    clin_df_senoage$age <- as.numeric(scale(clin_df_senoage[,"age"]))
+    clin_df_senoage[,temp_ensps] <- scale(clin_df_senoage[,temp_ensps])
+    form <- as.formula(paste("age ~ `",paste(temp_ensps,collapse="` + `"),"`",sep=""))
+    model <- lm(form,data=clin_df_senoage)
+    clin_df_senoage[,val] <- as.numeric(predict(model, newdata = clin_df_senoage))
+    #find regression line for age and seno-age
+    form <- as.formula(paste("`",val,"` ~ age",sep=""))
+    temp_model <- lm(form,data=clin_df_senoage)
+    #convert seno-age to age gap
+    clin_df_senoage[,val] <- resid(temp_model)
+    
+    #loop through all clinical traits; find cv Rsquared using tissue-specific age gap
+    for(i in trait_list){
+      #subset to only rows with trait listed
+      clin_df_i <- clin_df_senoage[!is.na(clin_df_senoage[,i]),]
+      #scale trait
+      clin_df_i[,i] <- as.numeric(scale(clin_df_i[,i]))
+      #create formula
+      form <- as.formula(paste("`",i,"`"," ~ `",val,"`", sep=""))
+      ##carot CV
+      #train the control
+      train_control <- trainControl(method="cv", number=10, seeds=seeds)
+      #train model
+      model <- train(form,
+                     data = clin_df_i,
+                     method = "lm",
+                     trControl = train_control,
+                     metric="Rsquared")
+      #find 10 iterations of Rsquared
+      cv_Rsquared <- model$resample$Rsquared
+      #fill master DF with Rsquared, tissue, trait
+      temp_df <- cbind(cv_Rsquared,rep(val,10),rep(i,10))
+      colnames(temp_df) <- c("Rsquared","Tissue","Trait")
+      df_master_Rsquared <- rbind(df_master_Rsquared,temp_df)
+    }
+    df_master_ensp[[val]] <- df_ensps_per_trait
+  }
+  
+  #Stop cluster
+  stopCluster(cluster)
+  
+  #return list of accuracy and ensp by trait
+  list <- list("Rsquared" = df_master_Rsquared, "ensp_table" = df_master_ensp)
+  return(list)
+}
+
